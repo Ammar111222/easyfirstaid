@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "886774767078",
+    "project_id": "easy-first-aid-e3f8f",
+    "storage_bucket": "easy-first-aid-e3f8f.appspot.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:886774767078:android:c06fb34ca1d944a1768a27",
+        "android_client_info": {
+          "package_name": "com.example.easy_first_aid"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAjdVXGes1tTvMDHZD6Yzgm_0mKl5lwtto"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
