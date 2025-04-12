@@ -98,6 +98,15 @@ class SearchFallDetectionService {
 
   void startFallDetection({bool debug = false}) {
     _debugMode = debug;
+    // Reset all flags and timers when starting detection
+    _isFallDetectionCooldown = false;
+    _isMonitoringPotentialFall = false;
+    _isNotificationActive = false;
+    _accelerationHistory.clear();
+    _fallConfirmationTimer?.cancel();
+    _cooldownTimer?.cancel();
+    _fallResponseTimer?.cancel();
+
     // Use a more sophisticated approach to fall detection
     Stream<AccelerometerEvent> accStream = accelerometerEvents;
 
@@ -109,9 +118,10 @@ class SearchFallDetectionService {
     });
 
     if (_debugMode) {
-      _debugLog("Fall detection service started");
+      _debugLog("Fall detection service started with all flags reset");
     }
   }
+
   void _processAccelerometerData(AccelerometerEvent event) {
     // Calculate magnitude of acceleration
     double acceleration = _calculateAcceleration(event.x, event.y, event.z);
@@ -123,8 +133,8 @@ class SearchFallDetectionService {
     }
 
     // Skip processing if we're in cooldown period
-    if (_isFallDetectionCooldown || _isNotificationActive) {
-      return; // Skip if in cooldown or notification is already active
+    if (_isFallDetectionCooldown) {
+      return;
     }
 
     // Phase 1: Detect free-fall condition (near zero acceleration) followed by impact
@@ -144,10 +154,10 @@ class SearchFallDetectionService {
               _debugLog("Post-impact stillness confirmed. Triggering fall alert.");
               _handlePossibleFall();
 
-              // Set cooldown to prevent multiple detections
+              // Set cooldown to prevent multiple detections (reduced to 5 seconds for testing)
               _isFallDetectionCooldown = true;
               _cooldownTimer?.cancel();
-              _cooldownTimer = Timer(Duration(seconds: 30), () {
+              _cooldownTimer = Timer(Duration(seconds: 5), () {
                 _isFallDetectionCooldown = false;
                 _debugLog("Fall detection cooldown ended");
               });
@@ -285,13 +295,12 @@ class SearchFallDetectionService {
   }
 
   Future<void> _handlePossibleFall() async {
-    if (_isNotificationActive) {
-      _debugLog("Notification already active, skipping duplicate");
-      return;
-    }
-    _isNotificationActive = true; // Set flag to prevent duplicates
-
     try {
+      _debugLog("Processing possible fall detection");
+      
+      // Reset notification active flag to allow new notifications
+      _isNotificationActive = false;
+
       Position position = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
       );
@@ -311,43 +320,27 @@ class SearchFallDetectionService {
       await _showActionNotification();
     } catch (e) {
       _debugLog('Error in _handlePossibleFall: $e');
-      print('Error handling fall detection: $e');
+      // Reset flags on error to ensure next detection can trigger
+      _isNotificationActive = false;
+      _isFallDetectionCooldown = false;
     }
-  }
-
-  void _showFallConfirmationDialog() {
-    // Start a timer to wait for user response
-    _fallResponseTimer?.cancel();
-    _fallResponseTimer = Timer(Duration(seconds: 30), () {
-      // If user doesn't respond in 30 seconds, assume they need help
-      _updateFallStatus('no_response');
-      _checkFallResponseStatus();
-    });
-
-    // Show notification with actions using the platform's native capabilities
-    _showActionNotification();
   }
 
   Future<void> _showActionNotification() async {
     try {
-      await notificationService.showActionableNotification(
-        title: 'Fall Detected',
-        body: 'Are you okay? Please respond within 30 seconds.',
-        payload: jsonEncode({
-          'type': 'fall_detection',
-          'timestamp': DateTime.now().toIso8601String(),
-        }),
-      );
-      _debugLog('Actionable notification shown successfully');
+      _debugLog('Starting to show action notification...');
 
+      // Set up the action handler before showing the notification
       notificationService.setActionHandler((payload, actionId) async {
         _debugLog('Action received: $actionId with payload: $payload');
         _fallResponseTimer?.cancel();
 
-        if (actionId == 'im_okay') {
+        if (actionId == 'ok_action') {
+          _debugLog('Processing "I\'m Okay" response');
           await _updateFallStatus('false_alarm');
           _debugLog('User confirmed they are okay');
-        } else if (actionId == 'need_help') {
+        } else if (actionId == 'help_action') {
+          _debugLog('Processing "Need Help" response');
           await _updateFallStatus('need_help');
           _debugLog('User requested help');
         }
@@ -357,11 +350,25 @@ class SearchFallDetectionService {
         _isNotificationActive = false;
       });
 
+      // Show the notification
+      await notificationService.showFallDetectionNotification(
+        title: 'Fall Detected',
+        body: 'Are you okay? Please respond within 30 seconds.',
+        payload: jsonEncode({
+          'type': 'fall_detection',
+          'timestamp': DateTime.now().toIso8601String(),
+        }),
+      );
+      _debugLog('Actionable notification shown successfully');
+
+      // Start 30-second timer for automatic parent notification
       _fallResponseTimer?.cancel();
       _fallResponseTimer = Timer(Duration(seconds: 30), () async {
-        await _updateFallStatus('no_response');
-        _debugLog('No response received within 30 seconds');
-        _isNotificationActive = false;
+        if (!_isNotificationActive) {
+          _debugLog('No response received within 30 seconds, updating status');
+          await _updateFallStatus('no_response');
+          _debugLog('No response status updated');
+        }
       });
     } catch (e) {
       _debugLog('Error showing action notification: $e');
@@ -371,9 +378,11 @@ class SearchFallDetectionService {
 
   Future<void> _updateFallStatus(String status) async {
     try {
+      _debugLog('Starting to update fall status: $status');
+      
       // Ensure we have a current user
       if (auth.currentUser == null) {
-        print('No current user found');
+        _debugLog('No current user found');
         return;
       }
 
@@ -382,12 +391,14 @@ class SearchFallDetectionService {
           .collection('users')
           .doc(auth.currentUser!.uid)
           .get();
+      _debugLog('Got user document');
 
       // Get last fall incident ID
       String? lastFallIncidentId = userDoc['lastFallIncidentId'];
+      _debugLog('Last fall incident ID: ${lastFallIncidentId ?? 'not found'}');
 
       if (lastFallIncidentId == null) {
-        print('No fall incident ID found');
+        _debugLog('No fall incident ID found');
         return;
       }
 
@@ -396,57 +407,66 @@ class SearchFallDetectionService {
         'status': status,
         'responseTime': FieldValue.serverTimestamp(),
       });
+      _debugLog('Fall incident status updated to: $status');
 
       // Determine if parent needs to be notified
       if (status == 'need_help' || status == 'no_response') {
-        // Notify parent with appropriate title
+        _debugLog('Status requires parent notification, proceeding...');
         await _notifyParentAboutFall();
       }
     } catch (e) {
-      print('Error updating fall status: $e');
+      _debugLog('Error updating fall status: $e');
     }
   }
 
   Future<void> _notifyParentAboutFall() async {
     try {
+      _debugLog('Starting parent notification process...');
+      
       // Get current user's document
       DocumentSnapshot userDoc = await firestore
           .collection('users')
           .doc(auth.currentUser!.uid)
           .get();
+      _debugLog('Got user document');
 
-      // Check if parent exists
+      // Check if parent exists with validation
       String? parentId = userDoc.get('parentId') as String?;
-      if (parentId == null) {
-        _debugLog('No parent ID found');
+      if (parentId == null || parentId.isEmpty) {
+        _debugLog('No valid parent ID found in user document');
+        // Log this as an error in Firestore
+        await firestore.collection('notification_errors').add({
+          'type': 'missing_parent_id',
+          'userId': auth.currentUser!.uid,
+          'timestamp': FieldValue.serverTimestamp(),
+          'error': 'No parent ID found for user',
+        });
         return;
       }
+      _debugLog('Found parent ID: $parentId');
 
       // Get current location
       Position position = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
       );
+      _debugLog('Got current location: ${position.latitude}, ${position.longitude}');
 
       // Send fall alert to parent with location
-      await notificationService.sendFallAlertToParent(
-        location: {
-          'latitude': position.latitude,
-          'longitude': position.longitude,
-        },
-        childId: auth.currentUser!.uid,
-      );
+      await notificationService.notifyParentAboutFall();
+      _debugLog('Parent notification sent');
 
       // Update fall incident to mark parent as notified
       String? lastFallIncidentId = userDoc.get('lastFallIncidentId') as String?;
       if (lastFallIncidentId != null) {
         await firestore.collection('fall_incidents').doc(lastFallIncidentId).update({
-          'parentNotified': true,
+        'parentNotified': true,
           'parentNotificationTime': FieldValue.serverTimestamp(),
           'parentNotificationStatus': 'sent',
         });
+        _debugLog('Fall incident updated with parent notification status');
       }
 
-      _debugLog('Parent notified about fall with location');
+      _debugLog('Parent notification process completed successfully');
     } catch (e) {
       _debugLog('Error notifying parent: $e');
       
@@ -462,7 +482,16 @@ class SearchFallDetectionService {
           'parentNotificationStatus': 'failed',
           'parentNotificationError': e.toString(),
         });
+        _debugLog('Error logged in fall incident document');
       }
+
+      // Log the error in the notification_errors collection
+      await firestore.collection('notification_errors').add({
+        'type': 'notification_error',
+        'userId': auth.currentUser!.uid,
+        'timestamp': FieldValue.serverTimestamp(),
+        'error': e.toString(),
+      });
     }
   }
 
@@ -487,7 +516,15 @@ class SearchFallDetectionService {
       ),
     );
 
+    // Start the service
     await service.startService();
+    
+    // Ensure the service is running
+    if (await service.isRunning()) {
+      _debugLog('Background service is running');
+    } else {
+      _debugLog('Failed to start background service');
+    }
   }
 
   @pragma('vm:entry-point')
@@ -505,7 +542,6 @@ class SearchFallDetectionService {
       fcm: fcm,
       onChildTap: (data) {
         _debugLog('Notification tapped in background: $data');
-        print('Notification tapped in background: $data');
       },
     );
 
@@ -517,31 +553,25 @@ class SearchFallDetectionService {
       notificationService: notificationService,
     );
 
+    // Start fall detection with debug mode
     fallDetectionService.startFallDetection(debug: true);
 
+    // Set up action handler for background notifications
     notificationService.setActionHandler((payload, actionId) async {
       _debugLog('Action received in background - ID: $actionId, Payload: $payload');
-      print('Background action received: $actionId');
       try {
         fallDetectionService._fallResponseTimer?.cancel();
         if (actionId == 'im_okay') {
           await fallDetectionService._updateFallStatus('false_alarm');
           _debugLog('User confirmed they are okay in background');
-          print('Background status updated to false_alarm');
         } else if (actionId == 'need_help') {
           await fallDetectionService._updateFallStatus('need_help');
           _debugLog('User requested help in background');
-          print('Background status updated to need_help');
-        } else {
-          _debugLog('Unknown or null background action ID: $actionId');
-          print('Background: No valid action ID received: $actionId');
         }
         await notificationService.cancelFallDetectionNotification();
         _debugLog('Notification canceled in background');
-        print('Background notification canceled');
       } catch (e) {
         _debugLog('Error handling notification action in background: $e');
-        print('Background action error: $e');
       }
     });
 
@@ -549,6 +579,7 @@ class SearchFallDetectionService {
       await service.setAsForegroundService();
     }
 
+    // Update notification every minute to keep the service alive
     Timer.periodic(Duration(minutes: 1), (timer) async {
       if (service is AndroidServiceInstance && await service.isForegroundService()) {
         service.setForegroundNotificationInfo(
@@ -558,6 +589,7 @@ class SearchFallDetectionService {
       }
     });
   }
+
   @pragma('vm:entry-point')
   Future<bool> onIosBackground(ServiceInstance service) async {
     WidgetsFlutterBinding.ensureInitialized();
@@ -760,6 +792,12 @@ class SearchFallDetectionService {
         'timestamp': FieldValue.serverTimestamp(),
       });
     }
+  }
+
+  void showNotification(QueryDocumentSnapshot notification) {
+    // Show notification in the UI
+    // Update the notification as read
+    notification.reference.update({'read': true});
   }
 }
 
