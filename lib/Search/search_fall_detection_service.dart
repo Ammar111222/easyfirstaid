@@ -91,242 +91,408 @@ class SearchFallDetectionService {
   bool _isFallDetectionCooldown = false;
   Timer? _fallConfirmationTimer;
   Timer? _cooldownTimer;
-  bool _isNotificationActive = false;
-  bool _isProcessingFall = false;
-  StreamSubscription<AccelerometerEvent>? _accelerometerSubscription;
-  DateTime? _lastFallDetectionTime;
-  
-  // Constants for fall detection
-  static const double FALL_THRESHOLD = 20.0; // Threshold for impact detection
-  static const double FREE_FALL_THRESHOLD = 3.0; // Threshold for free fall detection
-  static const double STILLNESS_THRESHOLD = 1.5; // Threshold for post-fall stillness
-  static const int COOLDOWN_DURATION = 30; // Cooldown duration in seconds
-  static const int MINIMUM_TIME_BETWEEN_DETECTIONS = 30; // seconds
-
+  bool _isNotificationActive = false; // Add this flag to track active notification
   // For debugging
   bool _debugMode = false;
   void Function(String)? onDebugMessage;
 
   void startFallDetection({bool debug = false}) {
     _debugMode = debug;
-    _debugLog('Starting fall detection service...');
-    
-    // Reset all flags
-    _isProcessingFall = false;
+    // Reset all flags and timers when starting detection
+    _isFallDetectionCooldown = false;
+    _isMonitoringPotentialFall = false;
+    _isNotificationActive = false;
+    _accelerationHistory.clear();
+    _fallConfirmationTimer?.cancel();
+    _cooldownTimer?.cancel();
     _fallResponseTimer?.cancel();
 
-    // Listen to accelerometer events
-    accelerometerEvents.listen(
-      (AccelerometerEvent event) {
-        if (!_isProcessingFall) {
-          _processAccelerometerData(event);
-        }
-      },
-      onError: (error) {
-        _debugLog('Error in accelerometer stream: $error');
-      },
-    );
+    // Use a more sophisticated approach to fall detection
+    Stream<AccelerometerEvent> accStream = accelerometerEvents;
+
+    // Use a fixed rate to sample accelerometer data
+    Timer.periodic(Duration(milliseconds: 50), (timer) {
+      accStream.first.then((AccelerometerEvent event) {
+        _processAccelerometerData(event);
+      });
+    });
+
+    if (_debugMode) {
+      _debugLog("Fall detection service started with all flags reset");
+    }
   }
 
   void _processAccelerometerData(AccelerometerEvent event) {
-    if (_isProcessingFall) return;
-
+    // Calculate magnitude of acceleration
     double acceleration = _calculateAcceleration(event.x, event.y, event.z);
-    
-    // Simple fall detection threshold
-    if (acceleration > 20.0) { // Adjust this threshold as needed
-      _handlePossibleFall();
+
+    // Update acceleration history
+    _accelerationHistory.add(acceleration);
+    if (_accelerationHistory.length > _historySize) {
+      _accelerationHistory.removeAt(0);
     }
+
+    // Skip processing if we're in cooldown period
+    if (_isFallDetectionCooldown) {
+      return;
+    }
+
+    // Phase 1: Detect free-fall condition (near zero acceleration) followed by impact
+    if (!_isMonitoringPotentialFall && _detectFreeFall()) {
+      _isMonitoringPotentialFall = true;
+      _debugLog("Free-fall detected! Monitoring for impact...");
+
+      // Set a timer to check for impact after free-fall
+      _fallConfirmationTimer?.cancel();
+      _fallConfirmationTimer = Timer(Duration(milliseconds: 300), () {
+        if (_detectImpact()) {
+          _debugLog("Impact detected! Checking post-impact stillness...");
+
+          // Phase 2: Check post-impact stillness
+          Timer(Duration(milliseconds: 1000), () {
+            if (_detectPostImpactStillness()) {
+              _debugLog("Post-impact stillness confirmed. Triggering fall alert.");
+              _handlePossibleFall();
+
+              // Set cooldown to prevent multiple detections (reduced to 5 seconds for testing)
+              _isFallDetectionCooldown = true;
+              _cooldownTimer?.cancel();
+              _cooldownTimer = Timer(Duration(seconds: 5), () {
+                _isFallDetectionCooldown = false;
+                _debugLog("Fall detection cooldown ended");
+              });
+            } else {
+              _debugLog("Post-impact stillness not detected - likely not a fall");
+            }
+          });
+        } else {
+          _debugLog("No significant impact detected - not a fall");
+        }
+        _isMonitoringPotentialFall = false;
+      });
+    }
+  }
+
+  bool _detectFreeFall() {
+    // Check if we have enough samples
+    if (_accelerationHistory.length < 5) return false;
+
+    // Get last few samples
+    List<double> recentSamples = _accelerationHistory.sublist(_accelerationHistory.length - 5);
+
+    // Check for free-fall signature (acceleration close to zero due to weightlessness)
+    // During free fall, acceleration approaches 0 m/s² as the device experiences weightlessness
+    // Normal gravity is around 9.8 m/s²
+    bool hasFreeFall = recentSamples.any((value) => value < 3.0);
+
+    return hasFreeFall;
+  }
+
+  bool _detectImpact() {
+    // Check if we have enough samples
+    if (_accelerationHistory.length < 10) return false;
+
+    // Get recent samples
+    List<double> recentSamples = _accelerationHistory.sublist(_accelerationHistory.length - 10);
+
+    // Calculate average before potential impact
+    double preImpactAvg = recentSamples.sublist(0, 5).reduce((a, b) => a + b) / 5;
+
+    // Find maximum acceleration (impact)
+    double maxAcceleration = recentSamples.reduce(max);
+
+    // Check if we have a significant impact spike (>20 m/s²) following potential free-fall
+    return maxAcceleration > 20.0 && maxAcceleration > preImpactAvg * 2.5;
+  }
+
+  bool _detectPostImpactStillness() {
+    // Check if we have enough samples
+    if (_accelerationHistory.length < _historySize) return false;
+
+    // Get the most recent samples after potential impact
+    List<double> postImpactSamples = _accelerationHistory.sublist(_accelerationHistory.length - 8);
+
+    // Calculate standard deviation to measure stillness
+    double mean = postImpactSamples.reduce((a, b) => a + b) / postImpactSamples.length;
+    double variance = postImpactSamples.map((x) => pow(x - mean, 2)).reduce((a, b) => a + b) / postImpactSamples.length;
+    double stdDev = _sqrt(variance);
+
+    // If standard deviation is low, the device is relatively still after impact
+    return stdDev < 5.0 && mean > 8.0 && mean < 12.0; // Close to normal gravity with little variation
+  }
+
+  double _calculateAcceleration(double x, double y, double z) {
+    return _calculateMagnitude(x, y, z);
+  }
+
+  double _calculateMagnitude(double x, double y, double z) {
+    return _calculateSquareRoot(x * x + y * y + z * z);
+  }
+
+  // Simple square root calculation
+  double _calculateSquareRoot(double value) {
+    return value <= 0 ? 0 : value > 0 ? _sqrt(value) : 0;
+  }
+
+  // Replacement for sqrt function
+  double _sqrt(double value) {
+    double a = value;
+    double x = 1;
+    for (int i = 0; i < 10; i++) {
+      x = 0.5 * (x + a / x);
+    }
+    return x;
+  }
+
+  // Debug logging
+  void _debugLog(String message) {
+    if (_debugMode) {
+      print("FallDetection: $message");
+      if (onDebugMessage != null) {
+        onDebugMessage!(message);
+      }
+    }
+  }
+
+  // Add this method to manually reset fall detection if needed
+  void resetFallDetection() {
+    _isFallDetectionCooldown = false;
+    _isMonitoringPotentialFall = false;
+    _accelerationHistory.clear();
+    _fallConfirmationTimer?.cancel();
+    _cooldownTimer?.cancel();
+    _debugLog("Fall detection manually reset");
+  }
+
+  // Test method to help calibrate the algorithm
+  Map<String, dynamic> getDebugData(AccelerometerEvent currentEvent) {
+    double currentAcceleration = _calculateAcceleration(
+        currentEvent.x, currentEvent.y, currentEvent.z);
+
+    // Calculate statistics on recent data
+    double mean = 0;
+    double stdDev = 0;
+
+    if (_accelerationHistory.isNotEmpty) {
+      mean = _accelerationHistory.reduce((a, b) => a + b) / _accelerationHistory.length;
+      double variance = _accelerationHistory
+          .map((x) => pow(x - mean, 2))
+          .reduce((a, b) => a + b) / _accelerationHistory.length;
+      stdDev = _sqrt(variance);
+    }
+
+    return {
+      'currentAcceleration': currentAcceleration,
+      'historyLength': _accelerationHistory.length,
+      'recentMean': mean,
+      'recentStdDev': stdDev,
+      'inCooldown': _isFallDetectionCooldown,
+      'monitoringFall': _isMonitoringPotentialFall,
+      'recentSamples': _accelerationHistory.length > 10
+          ? _accelerationHistory.sublist(_accelerationHistory.length - 10)
+          : _accelerationHistory.toList(),
+    };
   }
 
   Future<void> _handlePossibleFall() async {
-    if (_isProcessingFall) return;
-
     try {
-      _isProcessingFall = true;
-      _debugLog('Fall detected, showing notification');
+      _debugLog("Processing possible fall detection");
+      
+      // Reset notification active flag to allow new notifications
+      _isNotificationActive = false;
 
-      // Get current user
-      User? currentUser = auth.currentUser;
-      if (currentUser == null) {
-        _debugLog('No user logged in');
-        _isProcessingFall = false;
-        return;
-      }
+      Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
 
-      // Create fall incident
       DocumentReference fallIncidentRef = await firestore.collection('fall_incidents').add({
-        'childId': currentUser.uid,
+        'childId': auth.currentUser!.uid,
+        'location': GeoPoint(position.latitude, position.longitude),
         'timestamp': FieldValue.serverTimestamp(),
         'status': 'detected',
+        'acknowledged': false,
       });
 
-      // Show notification to child
-      await _showActionNotification(fallIncidentRef.id);
-
-      // Notify parent immediately
-      await _sendParentNotification(
-        'Fall Detected',
-        'A fall was detected for your child. Waiting for their response.',
-        fallIncidentRef.id,
-      );
-
-      // Start 30-second timer for no response
-      _fallResponseTimer = Timer(Duration(seconds: 30), () async {
-        DocumentSnapshot doc = await fallIncidentRef.get();
-        if (doc.exists && doc.get('status') == 'detected') {
-          await fallIncidentRef.update({'status': 'no_response'});
-          await _sendParentNotification(
-            'No Response',
-            'Your child has not responded to the fall detection alert!',
-            fallIncidentRef.id,
-          );
-        }
-        _isProcessingFall = false;
+      await firestore.collection('users').doc(auth.currentUser!.uid).update({
+        'lastFallIncidentId': fallIncidentRef.id,
       });
 
+      await _showActionNotification();
     } catch (e) {
-      _debugLog('Error handling fall: $e');
-      _isProcessingFall = false;
+      _debugLog('Error in _handlePossibleFall: $e');
+      // Reset flags on error to ensure next detection can trigger
+      _isNotificationActive = false;
+      _isFallDetectionCooldown = false;
     }
   }
 
-  Future<void> _showActionNotification(String fallIncidentId) async {
+  Future<void> _showActionNotification() async {
     try {
-      // Set up notification actions
+      _debugLog('Starting to show action notification...');
+
+      // Set up the action handler before showing the notification
       notificationService.setActionHandler((payload, actionId) async {
+        _debugLog('Action received: $actionId with payload: $payload');
         _fallResponseTimer?.cancel();
-        String status = actionId == 'ok_action' ? 'false_alarm' : 'need_help';
-        
-        await _updateFallStatus(status, fallIncidentId);
+
+        if (actionId == 'ok_action') {
+          _debugLog('Processing "I\'m Okay" response');
+          await _updateFallStatus('false_alarm');
+          _debugLog('User confirmed they are okay');
+        } else if (actionId == 'help_action') {
+          _debugLog('Processing "Need Help" response');
+          await _updateFallStatus('need_help');
+          _debugLog('User requested help');
+        }
 
         await notificationService.cancelFallDetectionNotification();
-        _isProcessingFall = false;
+        _debugLog('Notification canceled after action');
+        _isNotificationActive = false;
       });
 
-      // Show notification
+      // Show the notification
       await notificationService.showFallDetectionNotification(
         title: 'Fall Detected',
-        body: 'Are you okay? Please respond.',
+        body: 'Are you okay? Please respond within 30 seconds.',
         payload: jsonEncode({
-          'fallIncidentId': fallIncidentId,
+          'type': 'fall_detection',
+          'timestamp': DateTime.now().toIso8601String(),
         }),
       );
+      _debugLog('Actionable notification shown successfully');
 
+      // Start 30-second timer for automatic parent notification
+      _fallResponseTimer?.cancel();
+      _fallResponseTimer = Timer(Duration(seconds: 30), () async {
+        if (!_isNotificationActive) {
+          _debugLog('No response received within 30 seconds, updating status');
+          await _updateFallStatus('no_response');
+          _debugLog('No response status updated');
+        }
+      });
     } catch (e) {
-      _debugLog('Error showing notification: $e');
-      _isProcessingFall = false;
+      _debugLog('Error showing action notification: $e');
+      _isNotificationActive = false;
     }
   }
 
-  Future<void> _sendParentNotification(String title, String message, String fallIncidentId) async {
+  Future<void> _updateFallStatus(String status) async {
     try {
-      // Get current user
-      User? currentUser = auth.currentUser;
-      if (currentUser == null) return;
-
-      // Get parent ID
-      DocumentSnapshot userDoc = await firestore
-          .collection('users')
-          .doc(currentUser.uid)
-          .get();
-
-      String? parentId = (userDoc.data() as Map<String, dynamic>)?['parentId'];
-      if (parentId == null) return;
-
-      // Get parent's FCM token
-      DocumentSnapshot parentDoc = await firestore
-          .collection('users')
-          .doc(parentId)
-          .get();
-
-      String? parentFcmToken = (parentDoc.data() as Map<String, dynamic>)?['fcmToken'];
-      if (parentFcmToken == null) return;
-
-      // Send FCM message
-      await FirebaseMessaging.instance.sendMessage(
-        to: parentFcmToken,
-        data: {
-          'type': 'fall_detection',
-          'title': title,
-          'body': message,
-          'fallIncidentId': fallIncidentId,
-          'childId': currentUser.uid,
-          'timestamp': DateTime.now().toIso8601String(),
-          'click_action': 'FLUTTER_NOTIFICATION_CLICK',
-          'channel_id': 'fall_detection_channel',
-          'priority': 'high',
-        },
-      );
-
-      _debugLog('Sent notification to parent: $title');
-
-    } catch (e) {
-      _debugLog('Error sending parent notification: $e');
-    }
-  }
-
-  Future<void> _updateFallStatus(String status, String fallIncidentId) async {
-    try {
-      // Get current user
-      User? currentUser = auth.currentUser;
-      if (currentUser == null) {
-        _debugLog('No user logged in');
+      _debugLog('Starting to update fall status: $status');
+      
+      // Ensure we have a current user
+      if (auth.currentUser == null) {
+        _debugLog('No current user found');
         return;
       }
 
-      // If no fallIncidentId provided, get the latest one
-      if (fallIncidentId.isEmpty) {
-        QuerySnapshot latestIncident = await firestore
-            .collection('fall_incidents')
-            .where('childId', isEqualTo: currentUser.uid)
-            .orderBy('timestamp', descending: true)
-            .limit(1)
-            .get();
+      // Fetch user document
+      DocumentSnapshot userDoc = await firestore
+          .collection('users')
+          .doc(auth.currentUser!.uid)
+          .get();
+      _debugLog('Got user document');
 
-        if (latestIncident.docs.isEmpty) {
-          _debugLog('No fall incident found');
-          return;
-        }
+      // Get last fall incident ID
+      String? lastFallIncidentId = userDoc['lastFallIncidentId'];
+      _debugLog('Last fall incident ID: ${lastFallIncidentId ?? 'not found'}');
 
-        fallIncidentId = latestIncident.docs.first.id;
+      if (lastFallIncidentId == null) {
+        _debugLog('No fall incident ID found');
+        return;
       }
 
       // Update fall incident status
-      await firestore.collection('fall_incidents').doc(fallIncidentId).update({
+      await firestore.collection('fall_incidents').doc(lastFallIncidentId).update({
         'status': status,
         'responseTime': FieldValue.serverTimestamp(),
       });
+      _debugLog('Fall incident status updated to: $status');
 
-      // If user needs help, send notification to parent
-      if (status == 'need_help') {
-        await _sendParentNotification(
-          'Help Needed',
-          'Your child needs immediate assistance!',
-          fallIncidentId,
-        );
+      // Determine if parent needs to be notified
+      if (status == 'need_help' || status == 'no_response') {
+        _debugLog('Status requires parent notification, proceeding...');
+        await _notifyParentAboutFall();
       }
-
-      _debugLog('Fall status updated to: $status');
     } catch (e) {
       _debugLog('Error updating fall status: $e');
     }
   }
 
-  double _calculateAcceleration(double x, double y, double z) {
-    return sqrt(x * x + y * y + z * z);
-  }
+  Future<void> _notifyParentAboutFall() async {
+    try {
+      _debugLog('Starting parent notification process...');
+      
+      // Get current user's document
+      DocumentSnapshot userDoc = await firestore
+          .collection('users')
+          .doc(auth.currentUser!.uid)
+          .get();
+      _debugLog('Got user document');
 
-  void _debugLog(String message) {
-    if (_debugMode) {
-      print('FallDetectionService: $message');
-      onDebugMessage?.call(message);
+      // Check if parent exists with validation
+      String? parentId = userDoc.get('parentId') as String?;
+      if (parentId == null || parentId.isEmpty) {
+        _debugLog('No valid parent ID found in user document');
+        // Log this as an error in Firestore
+        await firestore.collection('notification_errors').add({
+          'type': 'missing_parent_id',
+          'userId': auth.currentUser!.uid,
+          'timestamp': FieldValue.serverTimestamp(),
+          'error': 'No parent ID found for user',
+        });
+        return;
+      }
+      _debugLog('Found parent ID: $parentId');
+
+      // Get current location
+      Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+      _debugLog('Got current location: ${position.latitude}, ${position.longitude}');
+
+      // Send fall alert to parent with location
+      await notificationService.notifyParentAboutFall();
+      _debugLog('Parent notification sent');
+
+      // Update fall incident to mark parent as notified
+      String? lastFallIncidentId = userDoc.get('lastFallIncidentId') as String?;
+      if (lastFallIncidentId != null) {
+        await firestore.collection('fall_incidents').doc(lastFallIncidentId).update({
+        'parentNotified': true,
+          'parentNotificationTime': FieldValue.serverTimestamp(),
+          'parentNotificationStatus': 'sent',
+        });
+        _debugLog('Fall incident updated with parent notification status');
+      }
+
+      _debugLog('Parent notification process completed successfully');
+    } catch (e) {
+      _debugLog('Error notifying parent: $e');
+      
+      // Get the last fall incident ID for error logging
+      DocumentSnapshot userDoc = await firestore
+          .collection('users')
+          .doc(auth.currentUser!.uid)
+          .get();
+          
+      String? lastFallIncidentId = userDoc.get('lastFallIncidentId') as String?;
+      if (lastFallIncidentId != null) {
+        await firestore.collection('fall_incidents').doc(lastFallIncidentId).update({
+          'parentNotificationStatus': 'failed',
+          'parentNotificationError': e.toString(),
+        });
+        _debugLog('Error logged in fall incident document');
+      }
+
+      // Log the error in the notification_errors collection
+      await firestore.collection('notification_errors').add({
+        'type': 'notification_error',
+        'userId': auth.currentUser!.uid,
+        'timestamp': FieldValue.serverTimestamp(),
+        'error': e.toString(),
+      });
     }
-  }
-
-  void dispose() {
-    _fallResponseTimer?.cancel();
-    _isProcessingFall = false;
   }
 
   // Modify the background service initialization
@@ -396,10 +562,10 @@ class SearchFallDetectionService {
       try {
         fallDetectionService._fallResponseTimer?.cancel();
         if (actionId == 'im_okay') {
-          await fallDetectionService._updateFallStatus('false_alarm', '');
+          await fallDetectionService._updateFallStatus('false_alarm');
           _debugLog('User confirmed they are okay in background');
         } else if (actionId == 'need_help') {
-          await fallDetectionService._updateFallStatus('need_help', '');
+          await fallDetectionService._updateFallStatus('need_help');
           _debugLog('User requested help in background');
         }
         await notificationService.cancelFallDetectionNotification();

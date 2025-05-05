@@ -1,3 +1,4 @@
+
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -180,30 +181,18 @@ class _SearchScreenState extends State<SearchScreen> {
     });
 
     try {
-      // Search for users by email or display name
+      // Search for users by email
       QuerySnapshot userSnapshot = await _firestore
           .collection('users')
-          .where('email', isGreaterThanOrEqualTo: query)
-          .where('email', isLessThan: query + '\uf8ff')
+          .where('email', isEqualTo: query)
           .get();
 
-      // Also search by display name
-      QuerySnapshot nameSnapshot = await _firestore
-          .collection('users')
-          .where('displayName', isGreaterThanOrEqualTo: query)
-          .where('displayName', isLessThan: query + '\uf8ff')
-          .get();
-
-      // Combine results and remove duplicates
-      Set<String> addedUsers = {};
       List<Map<String, dynamic>> results = [];
-
-      for (var doc in [...userSnapshot.docs, ...nameSnapshot.docs]) {
-        // Skip if user is the current user or already added
-        if (doc.id == _auth.currentUser!.uid || addedUsers.contains(doc.id)) continue;
+      for (var doc in userSnapshot.docs) {
+        // Skip if user is the current user
+        if (doc.id == _auth.currentUser!.uid) continue;
 
         Map<String, dynamic> data = doc.data() as Map<String, dynamic>;
-        addedUsers.add(doc.id);
 
         // Check if there's already a pending request
         QuerySnapshot pendingRequestsSnapshot = await _firestore
@@ -215,18 +204,18 @@ class _SearchScreenState extends State<SearchScreen> {
 
         bool hasPendingRequest = pendingRequestsSnapshot.docs.isNotEmpty;
 
-        // Check if this user is already a child (using direct check)
-        DocumentSnapshot userDoc = await _firestore
+        // Check if this user is already a child
+        QuerySnapshot childSnapshot = await _firestore
             .collection('users')
-            .doc(doc.id)
+            .where('uid', isEqualTo: doc.id)
+            .where('parentId', isEqualTo: _auth.currentUser!.uid)
             .get();
 
-        Map<String, dynamic> userData = userDoc.data() as Map<String, dynamic>;
-        bool isAlreadyChild = userData['parentId'] == _auth.currentUser!.uid;
+        bool isAlreadyChild = childSnapshot.docs.isNotEmpty;
 
         results.add({
           'uid': doc.id,
-          'email': data['email'] ?? '',
+          'email': data['email'],
           'displayName': data['displayName'] ?? 'User',
           'hasPendingRequest': hasPendingRequest,
           'isAlreadyChild': isAlreadyChild,
@@ -241,11 +230,7 @@ class _SearchScreenState extends State<SearchScreen> {
       print('Error searching users: $e');
       setState(() {
         _isSearching = false;
-        _searchResults = [];
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error searching users: ${e.toString()}')),
-      );
     }
   }
 
@@ -328,29 +313,6 @@ class _SearchScreenState extends State<SearchScreen> {
     }
   }
 
-  Future<void> _deleteChild(String childId) async {
-    try {
-      // Update the child user to remove parentId
-      await _firestore.collection('users').doc(childId).update({
-        'parentId': null,
-      });
-
-      // Remove child from local list
-      setState(() {
-        _children.removeWhere((child) => child['uid'] == childId);
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Child removed successfully')),
-      );
-    } catch (e) {
-      print('Error removing child: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Failed to remove child')),
-      );
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -383,7 +345,6 @@ class _SearchScreenState extends State<SearchScreen> {
             ),
             ChildrenListWidget(
               children: _children,
-              onDeleteChild: _deleteChild,
             ),
           ],
         ),
