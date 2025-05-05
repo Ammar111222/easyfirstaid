@@ -1,13 +1,14 @@
-
 import 'package:easy_first_aid/Search/widgets/child_tracking_screen.dart';
 import 'package:flutter/material.dart';
 
 class ChildrenListWidget extends StatelessWidget {
   final List<Map<String, dynamic>> children;
+  final Function(String) onDeleteChild;
 
   const ChildrenListWidget({
     Key? key,
     required this.children,
+    required this.onDeleteChild,
   }) : super(key: key);
 
   @override
@@ -71,6 +72,33 @@ class ChildrenListWidget extends StatelessWidget {
                             Text(child['email']),
                           ],
                         ),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.delete, color: Colors.red),
+                        onPressed: () {
+                          showDialog(
+                            context: context,
+                            builder: (BuildContext context) {
+                              return AlertDialog(
+                                title: const Text('Remove Child'),
+                                content: Text('Are you sure you want to remove ${child['displayName']} from your children list?'),
+                                actions: [
+                                  TextButton(
+                                    child: const Text('Cancel'),
+                                    onPressed: () => Navigator.of(context).pop(),
+                                  ),
+                                  TextButton(
+                                    child: const Text('Remove', style: TextStyle(color: Colors.red)),
+                                    onPressed: () {
+                                      Navigator.of(context).pop();
+                                      onDeleteChild(child['uid']);
+                                    },
+                                  ),
+                                ],
+                              );
+                            },
+                          );
+                        },
                       ),
                       const Icon(Icons.arrow_forward_ios),
                     ],
