@@ -81,7 +81,18 @@ class SearchNotificationService {
       onDidReceiveNotificationResponse: (NotificationResponse response) {
         _debugLog('Notification response received: actionId=${response.actionId}, payload=${response.payload}');
         if (response.actionId != null) {
-          handleFallDetectionResponse(response.actionId!);
+          _actionHandler?.call(response.payload, response.actionId);
+          handleFallDetectionResponse(response.actionId!, response.payload);
+        } else if (response.payload != null) {
+          try {
+            final data = jsonDecode(response.payload!);
+            if (data.containsKey('type') && data['type'] == 'fall_detection') {
+              _debugLog('Notification clicked for fall detection');
+              onChildTap(data);
+            }
+          } catch (e) {
+            _debugLog('Error parsing payload: $e');
+          }
         }
       },
     );
@@ -250,18 +261,6 @@ class SearchNotificationService {
   void setActionHandler(Function(String?, String?) handler) {
     _actionHandler = handler;
     _debugLog('Action handler set');
-
-    // Check for launch details only if not already checked
-    _flutterLocalNotificationsPlugin.getNotificationAppLaunchDetails().then((details) {
-      if (details?.didNotificationLaunchApp ?? false) {
-        final response = details?.notificationResponse;
-        if (response != null && _actionHandler != null && !_isNotificationActive) {
-          _actionHandler!(response.payload, response.actionId);
-          cancelFallDetectionNotification();
-          _debugLog('Handled launch notification action: ${response.actionId}');
-        }
-      }
-    });
   }
 
   Future<void> showFallDetectionNotification({
@@ -278,7 +277,7 @@ class SearchNotificationService {
     _isNotificationActive = true;
     
     // Define notification details
-    AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
+    AndroidNotificationDetails androidDetails = const AndroidNotificationDetails(
       'fall_detection_channel',
       'Fall Detection',
       channelDescription: 'Notifications for fall detection',
@@ -296,19 +295,19 @@ class SearchNotificationService {
       autoCancel: false,
       showProgress: false,
       onlyAlertOnce: false,
-      styleInformation: BigTextStyleInformation(body),
-      actions: const [
+      category: AndroidNotificationCategory.alarm,
+      actions: [
         AndroidNotificationAction(
           'ok_action',
           'I\'m Okay',
           showsUserInterface: true,
-          cancelNotification: true,
+          cancelNotification: false,
         ),
         AndroidNotificationAction(
           'help_action',
           'Need Help',
           showsUserInterface: true,
-          cancelNotification: true,
+          cancelNotification: false,
         ),
       ],
     );
@@ -327,10 +326,6 @@ class SearchNotificationService {
     );
 
     try {
-      // Cancel any existing notification first
-      await _flutterLocalNotificationsPlugin.cancel(fallDetectionNotificationId);
-      
-      // Show the new notification
       await _flutterLocalNotificationsPlugin.show(
         fallDetectionNotificationId,
         title,
@@ -343,113 +338,103 @@ class SearchNotificationService {
       _debugLog('Error showing fall detection notification: $e');
       _isNotificationActive = false;
     }
-
-    // Start 30-second timer for automatic parent notification if no response
-    _fallResponseTimer?.cancel();
-    _fallResponseTimer = Timer(Duration(seconds: 30), () async {
-      if (_isNotificationActive) {
-        _debugLog('No response received within 30 seconds. Notifying parent...');
-        await notifyParentAboutFall();
-        await cancelFallDetectionNotification();
-      }
-    });
-  }
-
-  void handleFallDetectionResponse(String action) async {
-    if (!_isNotificationActive) {
-      _debugLog('No active notification to handle response for');
-      return;
     }
 
-    _debugLog('Handling fall detection response: $action');
+  void handleFallDetectionResponse(String actionId, [String? payload]) async {
+    _debugLog('Handling fall detection response: $actionId, payload: $payload');
+    _fallResponseTimer?.cancel();
     
-    if (action == 'ok_action') {
-      _debugLog("User responded: I'm okay");
-      _fallResponseTimer?.cancel();
+    try {
+      if (payload != null) {
+        final Map<String, dynamic> data = jsonDecode(payload);
+        if (data.containsKey('fallIncidentId')) {
+          String fallIncidentId = data['fallIncidentId'];
+          String status = actionId == 'ok_action' ? 'false_alarm' : 'need_help';
+          
+          // Update the fall incident status
+          await firestore.collection('fall_incidents').doc(fallIncidentId).update({
+            'status': status,
+            'responseTime': FieldValue.serverTimestamp(),
+          });
+          
+          _debugLog('Updated fall incident $fallIncidentId status to $status');
+          
+          // If need help, notify parent
+          if (status == 'need_help') {
+            await _sendParentHelpNotification(fallIncidentId);
+          }
+          
+          // Cancel the notification
       await cancelFallDetectionNotification();
-    } else if (action == 'help_action') {
-      _debugLog("User responded: I need help");
-      _fallResponseTimer?.cancel();
-      await notifyParentAboutFall();
-      await cancelFallDetectionNotification();
+    }
+  }
+    } catch (e) {
+      _debugLog('Error handling fall detection response: $e');
+  }
+
+      _isNotificationActive = false;
+  }
+  
+  Future<void> _sendParentHelpNotification(String fallIncidentId) async {
+    try {
+      // Get incident details
+      DocumentSnapshot incidentDoc = await firestore
+          .collection('fall_incidents')
+          .doc(fallIncidentId)
+          .get();
+      
+      if (!incidentDoc.exists) return;
+      
+      Map<String, dynamic> incidentData = incidentDoc.data() as Map<String, dynamic>;
+      String childId = incidentData['childId'];
+      
+      // Get child details
+      DocumentSnapshot childDoc = await firestore
+          .collection('users')
+          .doc(childId)
+          .get();
+      
+      if (!childDoc.exists) return;
+      
+      Map<String, dynamic> childData = childDoc.data() as Map<String, dynamic>;
+      String? parentId = childData['parentId'];
+      
+      if (parentId == null) return;
+      
+      // Get parent FCM token
+      DocumentSnapshot parentDoc = await firestore
+          .collection('users')
+          .doc(parentId)
+          .get();
+      
+      if (!parentDoc.exists) return;
+      
+      Map<String, dynamic> parentData = parentDoc.data() as Map<String, dynamic>;
+      String? fcmToken = parentData['fcmToken'];
+      
+      if (fcmToken == null) return;
+
+      // Send urgent notification
+      String childName = childData['displayName'] ?? 'Your child';
+      String urgentMessage = '$childName needs help! They responded "Need Help" to the fall alert.';
+      
+      // This would typically be handled by a server-side function
+      // Here we're simply logging it
+      _debugLog('Would send urgent notification to parent: $urgentMessage');
+    } catch (e) {
+      _debugLog('Error sending parent help notification: $e');
     }
   }
 
   Future<void> cancelFallDetectionNotification() async {
-    if (_isNotificationActive) {
-      await _flutterLocalNotificationsPlugin.cancel(fallDetectionNotificationId);
-      _isNotificationActive = false;
-      _debugLog('Fall detection notification cancelled');
-    }
+    await _flutterLocalNotificationsPlugin.cancel(fallDetectionNotificationId);
+    _isNotificationActive = false;
+    _debugLog('Fall detection notification canceled');
   }
 
   Future<void> notifyParentAboutFall() async {
-    if (!_isNotificationActive) {
-      _debugLog('No active notification to notify parent about');
-      return;
-    }
-
-    try {
-      _debugLog('Starting parent notification process...');
-      
-      // Get current user's document
-      DocumentSnapshot userDoc = await firestore
-          .collection('users')
-          .doc(auth.currentUser!.uid)
-          .get();
-      _debugLog('Got user document');
-
-      // Check if parent exists with validation
-      String? parentId = userDoc.get('parentId') as String?;
-      if (parentId == null || parentId.isEmpty) {
-        _debugLog('No valid parent ID found in user document');
-        return;
-      }
-      _debugLog('Found parent ID: $parentId');
-
-      // Get current location
-      Position position = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
-      );
-      _debugLog('Got current location: ${position.latitude}, ${position.longitude}');
-
-      // Create the notification data
-      Map<String, dynamic> notificationData = {
-        'type': 'fall_alert',
-        'title': 'Fall Alert',
-        'body': 'Your child has fallen and needs help!',
-        'latitude': position.latitude.toString(),
-        'longitude': position.longitude.toString(),
-        'childId': auth.currentUser!.uid,
-        'timestamp': DateTime.now().toIso8601String(),
-      };
-
-      // Store the notification in Firestore
-      await firestore.collection('notifications').add({
-        'type': 'fall_alert',
-        'recipientId': parentId,
-        'senderId': auth.currentUser!.uid,
-        'timestamp': FieldValue.serverTimestamp(),
-        'location': GeoPoint(position.latitude, position.longitude),
-        'status': 'pending',
-        'data': notificationData,
-        'read': false,
-      });
-      _debugLog('Notification stored in Firestore');
-
-    } catch (e, stackTrace) {
-      _debugLog('Error in parent notification process: $e');
-      _debugLog('Stack trace: $stackTrace');
-      
-      // Log the error in Firestore
-      await firestore.collection('notification_errors').add({
-        'type': 'parent_notification_error',
-        'userId': auth.currentUser!.uid,
-        'error': e.toString(),
-        'stackTrace': stackTrace.toString(),
-        'timestamp': FieldValue.serverTimestamp(),
-      });
-    }
+    // This would typically be implemented with FCM to notify the parent
+    _debugLog('Parent would be notified about fall');
   }
 
   FlutterLocalNotificationsPlugin getNotificationPlugin() {

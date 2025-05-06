@@ -153,7 +153,7 @@ class _SearchScreenState extends State<SearchScreen> {
         children.add({
           'uid': doc.id,
           'email': data['email'],
-          'displayName': data['displayName'] ?? 'Child User',
+          'displayName': data['displayName'] ?? (data['email']?.split('@').first ?? 'Child User'),
           'location': data['location'],
         });
       }
@@ -227,7 +227,7 @@ class _SearchScreenState extends State<SearchScreen> {
         results.add({
           'uid': doc.id,
           'email': data['email'] ?? '',
-          'displayName': data['displayName'] ?? 'User',
+          'displayName': data['displayName'] ?? (data['email']?.split('@').first ?? 'User'),
           'hasPendingRequest': hasPendingRequest,
           'isAlreadyChild': isAlreadyChild,
         });

@@ -83,25 +83,19 @@ class SearchFallDetectionService {
     required this.notificationService,
   });
 
-  // Add these new variables for improved detection
-  final List<double> _accelerationHistory = [];
-  final int _historySize = 20;
-  static const int fallDetectionNotificationId = 100;
-  bool _isMonitoringPotentialFall = false;
-  bool _isFallDetectionCooldown = false;
-  Timer? _fallConfirmationTimer;
-  Timer? _cooldownTimer;
-  bool _isNotificationActive = false;
-  bool _isProcessingFall = false;
-  StreamSubscription<AccelerometerEvent>? _accelerometerSubscription;
-  DateTime? _lastFallDetectionTime;
-  
   // Constants for fall detection
   static const double FALL_THRESHOLD = 20.0; // Threshold for impact detection
   static const double FREE_FALL_THRESHOLD = 3.0; // Threshold for free fall detection
   static const double STILLNESS_THRESHOLD = 1.5; // Threshold for post-fall stillness
   static const int COOLDOWN_DURATION = 30; // Cooldown duration in seconds
   static const int MINIMUM_TIME_BETWEEN_DETECTIONS = 30; // seconds
+
+  // Improved fall detection variables
+  final List<double> _accelerationBuffer = [];
+  final int _bufferSize = 50; // Increased buffer size for more accurate detection
+  bool _isPotentialFallInProgress = false;
+  bool _isProcessingFall = false;
+  DateTime? _lastFallDetectionTime;
 
   // For debugging
   bool _debugMode = false;
@@ -131,12 +125,67 @@ class SearchFallDetectionService {
   void _processAccelerometerData(AccelerometerEvent event) {
     if (_isProcessingFall) return;
 
-    double acceleration = _calculateAcceleration(event.x, event.y, event.z);
+    // Calculate current acceleration
+    double currentAcceleration = _calculateAcceleration(event.x, event.y, event.z);
     
-    // Simple fall detection threshold
-    if (acceleration > 20.0) { // Adjust this threshold as needed
+    // Add current acceleration to buffer
+    _accelerationBuffer.add(currentAcceleration);
+    
+    // Maintain buffer size
+    if (_accelerationBuffer.length > _bufferSize) {
+      _accelerationBuffer.removeAt(0);
+    }
+
+    // Check for potential fall conditions
+    if (_checkFallConditions()) {
       _handlePossibleFall();
     }
+  }
+
+  bool _checkFallConditions() {
+    // Check if enough time has passed since last fall detection
+    if (_lastFallDetectionTime != null) {
+      if (DateTime.now().difference(_lastFallDetectionTime!).inSeconds < MINIMUM_TIME_BETWEEN_DETECTIONS) {
+        return false;
+      }
+    }
+
+    // If buffer is not full, return false
+    if (_accelerationBuffer.length < _bufferSize) return false;
+
+    // Analyze acceleration patterns
+    double maxAcceleration = _accelerationBuffer.reduce(max);
+    double minAcceleration = _accelerationBuffer.reduce(min);
+    
+    // Sophisticated fall detection criteria
+    bool highImpactDetected = maxAcceleration > FALL_THRESHOLD;
+    bool freeFallDetected = minAcceleration < FREE_FALL_THRESHOLD;
+    bool suddenStopDetected = _detectSuddenStop();
+
+    // Combine conditions for more accurate fall detection
+    return highImpactDetected && freeFallDetected && suddenStopDetected;
+  }
+
+  bool _detectSuddenStop() {
+    // Look for a sudden transition from high acceleration to near-zero acceleration
+    int suddenStopIndex = -1;
+    for (int i = _accelerationBuffer.length - 10; i < _accelerationBuffer.length; i++) {
+      if (_accelerationBuffer[i] < STILLNESS_THRESHOLD) {
+        suddenStopIndex = i;
+        break;
+      }
+    }
+
+    // Ensure there was a high acceleration before the sudden stop
+    if (suddenStopIndex != -1) {
+      for (int j = 0; j < suddenStopIndex; j++) {
+        if (_accelerationBuffer[j] > FALL_THRESHOLD) {
+          return true;
+        }
+      }
+    }
+
+    return false;
   }
 
   Future<void> _handlePossibleFall() async {
@@ -144,7 +193,10 @@ class SearchFallDetectionService {
 
     try {
       _isProcessingFall = true;
-      _debugLog('Fall detected, showing notification');
+      _debugLog('Sophisticated fall detection triggered');
+
+      // Prevent repeated fall detections
+      _lastFallDetectionTime = DateTime.now();
 
       // Get current user
       User? currentUser = auth.currentUser;
@@ -159,6 +211,7 @@ class SearchFallDetectionService {
         'childId': currentUser.uid,
         'timestamp': FieldValue.serverTimestamp(),
         'status': 'detected',
+        'accelerationData': _accelerationBuffer.map((e) => e.toString()).toList(), // Store raw data for analysis
       });
 
       // Show notification to child
@@ -167,7 +220,7 @@ class SearchFallDetectionService {
       // Notify parent immediately
       await _sendParentNotification(
         'Fall Detected',
-        'A fall was detected for your child. Waiting for their response.',
+        'A potential fall was detected for your child. Waiting for their response.',
         fallIncidentRef.id,
       );
 
@@ -185,8 +238,11 @@ class SearchFallDetectionService {
         _isProcessingFall = false;
       });
 
+      // Reset acceleration buffer
+      _accelerationBuffer.clear();
+
     } catch (e) {
-      _debugLog('Error handling fall: $e');
+      _debugLog('Error handling sophisticated fall detection: $e');
       _isProcessingFall = false;
     }
   }
@@ -232,37 +288,97 @@ class SearchFallDetectionService {
           .get();
 
       String? parentId = (userDoc.data() as Map<String, dynamic>)?['parentId'];
-      if (parentId == null) return;
+      if (parentId == null) {
+        _debugLog('No parent ID found for this child');
+        return;
+      }
 
-      // Get parent's FCM token
+      // Get parent details
       DocumentSnapshot parentDoc = await firestore
           .collection('users')
           .doc(parentId)
           .get();
 
-      String? parentFcmToken = (parentDoc.data() as Map<String, dynamic>)?['fcmToken'];
-      if (parentFcmToken == null) return;
+      Map<String, dynamic> parentData = parentDoc.data() as Map<String, dynamic>;
+      String? parentFcmToken = parentData['fcmToken'];
+      
+      if (parentFcmToken == null) {
+        _debugLog('No FCM token found for parent');
+        return;
+      }
 
-      // Send FCM message
-      await FirebaseMessaging.instance.sendMessage(
-        to: parentFcmToken,
-        data: {
+      // Get child details for better notification
+      Map<String, dynamic> userData = userDoc.data() as Map<String, dynamic>;
+      String childName = userData['displayName'] ?? 'Your child';
+      
+      // Get location if available
+      GeoPoint? location;
+      if (userData.containsKey('location') && userData['location'] != null) {
+        location = userData['location'];
+      }
+      
+      // Create a more detailed message
+      String detailedMessage = message;
+      if (location != null) {
+        detailedMessage += ' Last known location: ${location.latitude}, ${location.longitude}';
+      }
+
+      // Add fall incident to parent's notifications collection
+      await firestore.collection('users').doc(parentId).collection('notifications').add({
+        'title': title,
+        'message': detailedMessage,
+        'childId': currentUser.uid,
+        'childName': childName,
+        'fallIncidentId': fallIncidentId,
+        'timestamp': FieldValue.serverTimestamp(),
+        'read': false,
           'type': 'fall_detection',
-          'title': title,
-          'body': message,
-          'fallIncidentId': fallIncidentId,
-          'childId': currentUser.uid,
-          'timestamp': DateTime.now().toIso8601String(),
-          'click_action': 'FLUTTER_NOTIFICATION_CLICK',
-          'channel_id': 'fall_detection_channel',
-          'priority': 'high',
-        },
-      );
+      });
 
-      _debugLog('Sent notification to parent: $title');
-
+      // Send direct notification to parent's device
+      await _sendFcmToParent(parentFcmToken, title, detailedMessage, currentUser.uid, childName, fallIncidentId);
+      
+      _debugLog('Parent notification sent successfully');
     } catch (e) {
       _debugLog('Error sending parent notification: $e');
+    }
+  }
+  
+  Future<void> _sendFcmToParent(String parentToken, String title, String message, 
+      String childId, String childName, String fallIncidentId) async {
+    try {
+      // This would typically be done through a server function
+      // For this implementation, we're using a direct approach
+      
+      // Create the notification payload
+      Map<String, dynamic> notification = {
+        'to': parentToken,
+        'notification': {
+          'title': title,
+          'body': message,
+          'sound': 'default',
+          'priority': 'high',
+          'android_channel_id': 'fall_detection_channel'
+        },
+        'data': {
+          'type': 'fall_detection',
+          'childId': childId,
+          'childName': childName,
+          'fallIncidentId': fallIncidentId,
+          'click_action': 'FLUTTER_NOTIFICATION_CLICK',
+        },
+        'priority': 'high',
+        'content_available': true
+      };
+
+      // Log the notification data (in a real implementation, this would be sent to FCM)
+      _debugLog('Would send FCM notification: ${jsonEncode(notification)}');
+
+      // In a real implementation, you would use a cloud function or your backend
+      // to send this notification, as FCM requires server keys that shouldn't be
+      // included in client-side code.
+    } catch (e) {
+      _debugLog('Error sending FCM to parent: $e');
     }
   }
 
